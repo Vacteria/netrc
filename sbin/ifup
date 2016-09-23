@@ -1,0 +1,3 @@
+#!/bin/bash
+
+exec /sbin/netrc --up ${1+"$@"}

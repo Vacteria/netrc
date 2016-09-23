@@ -1,0 +1,664 @@
+#!/bin/bash
+
+if command -v gettext &>/dev/null
+then
+	alias gettext='gettext -e'
+else
+	alias gettext='printf '%s''
+fi
+
+ERROR=$(gettext 'ERROR')
+WARN=$(gettext 'WARN')
+NETDIR="/etc/network.d"
+SYSNET="/sys/class/net"
+PARTDIR="/etc/wpa_supplicant.conf.d"
+NETPIDS="/run/netrc"
+
+usage()
+{
+	printf "$(gettext 'Usage : 
+ %s [option] [interface]
+ 
+Options :
+ -c,--create   Create a new config file for network interface
+ -u,--up       Setting up configured network interface
+ -d,--down     Setting down configured network interface
+ -h,--help     Show this help and exit
+ ')" "${MYSELF}"
+}
+
+msg()
+{
+	local MSG="${1}"
+	shift 1
+
+	printf "${MSG}\n" "${@}"
+	return 0
+}
+
+die()
+{
+	local MSG="${1}"
+	shift 1
+
+	printf "${ERROR} : ${MSG}\n" "${@}"
+	exit 1
+}
+
+warn()
+{
+	local MSG="${1}"
+	shift 1
+
+	printf "${WARN} : ${MSG}\n" "${@}"
+}
+
+error()
+{
+	local MSG="${1}"
+	shift 1
+
+	printf "${ERROR} : ${MSG}\n" "${@}"
+}
+
+debug()
+{
+	local MSG="${1}"
+	shift 1
+
+	if [ "${AND_VERBOSE}" == "1" ]
+	then
+		printf "${DEBUG} : ${MSG}\n" "${@}"
+	fi
+}
+
+dbg_autoset()
+{
+	debug "$(gettext 'Auto setting %s variable with 5s value')" "${1}" "${2}"
+}
+
+dbg_will_use()
+{
+	debug "$(gettext 'Using %s value for %s field')" "${2}" "${1}"
+}
+
+dbg_pid_found()
+{
+	debug "$(gettext '%s pid found, killing')" "${2}" "${1}"
+}
+
+upper()
+{
+	echo ${@} | tr '[[:lower:]]' '[[:upper:]]'
+
+	return 0
+}
+
+lower()
+{
+	echo ${@} | tr '[[:upper:]]' '[[:lower:]]'
+
+	return 0
+}
+
+commander()
+{
+	command -v ${1} &>/dev/null
+
+	return $?
+}
+
+reset_cfgfile()
+{
+	for VAR in \
+		PROTO IPADDR NETMASK GATEWAY HWADDR \
+		MTU ESSID KEY WPROTO DRIVER
+	do
+		unset ${VAR}
+	done
+
+	for FUNC in pre_up pre_down post_up post_down
+	do
+		unset ${FUNC}
+	done
+
+	return 0
+}
+
+if_detected()
+{
+	SYSDEV="${SYSNET}/${1}"
+	[ ! -L "${SYSDEV}" ] && die "$(gettext '%s interface does not exist')" "${1}"
+
+	return 0 
+}
+
+if_configured()
+{
+	CFGFILE="${NETDIR}/${1}"
+	[ ! -f "${CFGFILE}" ] && die "$(gettext '%s interface have not configuration file')" "${1}"
+
+	return 0
+}
+
+if_wireless()
+{
+	[[ -r ${SYSDEV}/wireless || -r ${SYSDEV}/phy80211 ]] && return 1
+
+	return 0		
+}
+
+if_alias()
+{
+	local IF=${1}
+
+	IF_MASTER="${IF%:*}"
+	IF_SLAVE="${IF##*:}"
+
+	[ "${IF_MASTER}" != "${IF_SLAVE}" ] && return 1
+
+	unset IF_MASTER
+	unset IF_SLAVE
+
+	return 0
+}
+
+if_state()
+{
+	local IF CARRIER
+
+	IF="${1}"
+	[ ! -f ${SYSNET}/${IF} ] && return 1
+
+	CARRIER="$(cat ${SYSNET}/${IF}/carrier 2>/dev/null)"
+
+	case "X$(lower ${CARRIER})" in
+		Xunknow|X1 ) return 1 ;;
+		Xdown|X0|X ) return 0 ;;
+	esac
+
+	return 0
+}
+
+get_hwaddr()
+{
+	echo $(upper $(cat ${SYSDEV}/address))
+}
+
+get_bolean()
+{
+	local INPUT
+
+	INPUT="$(lower ${1})"
+
+	case ${INPUT} in
+		yes|true|y|s|si|1 ) return 1 ;;
+		no|false|n|0      ) return 0 ;;
+	esac
+
+}
+
+get_psk()
+{
+	wpa_passphrase ${1} ${2} | grep -E "(^|[[:space:]])psk=*" | tr -d '\t' | cut -d "=" -f 2
+
+	return 0
+}
+
+create_interfaces()
+{
+	[ -z "${@}" ] && return 1
+
+	for I in ${@}
+	do
+		if_detected ${I}
+cat > ${NETDIR}/${I} <<EOF
+ONBOOT="1"
+PROTO="dhcp"
+IPADDR=""
+NETMASK=""
+GATEWAY=""
+HWADDR="$(get_hwaddr)"
+MTU="1500"
+EOF
+		if ! if_wireless ${I}
+		then
+cat >> ${NETDIR}/${I} <<EOF
+ESSID=""
+BSSID=""
+KEY=""
+WPROTO=""
+DRIVER=""
+EOF
+		fi
+	done
+
+	return 0
+}
+
+up_wireless()
+{
+	local IF NEW_KEY RET count
+
+	IF="${1}"
+
+	[ -z ${IF} ] && return 1
+	
+	if [ -z "${DRIVER}" ]
+	then
+		DRIVER="wext"
+		dbg_autoset DRIVER ${DRIVER}
+	fi
+
+	[ -z "${ESSID}" ] && FAIL+=" ESSID"		
+	if [ -n "${WPROTO}" ]
+	then
+	 	case ${WPROTO} in
+			wpa|wpa2 ) [ -z "${KEY}" ] && FAIL+=" KEY" ;;
+			wep      ) KEY="${KEY}" ;;
+		esac
+	else
+		FAIL+=" WPROTO"
+	fi
+
+	if [ -n "${FAIL}" ] 
+	then
+		error "$(gettext 'Missing connection dates for %s :\n%s')" "${IF}" "${FAIL}"
+		return 1
+	fi
+
+	debug "$(gettext 'Printing part config file')"
+	cat > ${PARTDIR}/${IF}.conf <<EOF
+ctrl_interface=/run/wpa_supplicant
+
+network={
+	ssid="${ESSID}"
+EOF
+	if [ -n "${BSSID}" ]
+	then
+		cat >> ${PARTDIR}/${IF}.conf <<EOF
+	bssid=${BSSID}
+EOF
+	fi
+			
+	case ${WPROTO} in
+		wpa|wpa2 )
+			NEW_KEY=$(get_psk ${ESSID} ${KEY})
+			RET=$?
+
+			if [[ -z "${NEW_KEY}" && "${RET}" == "0" ]]
+			then
+				NEW_KEY="${KEY}"
+			else
+				NEW_KEY="${NEW_KEY}"
+			fi
+
+			cat >> ${PARTDIR}/${IF}.conf <<EOF
+	proto=WPA
+	key_mgmt=WPA-PSK
+	pairwise=CCMP TKIP
+	group=CCMP TKIP
+	psk=${NEW_KEY}
+EOF
+		;;
+		wep )
+			cat >> ${PARTDIR}/${IF}.conf <<EOF
+	key_mgmt=NONE
+EOF
+			if [ -n "${KEY}" ]
+			then
+				cat >> ${PARTDIR}/${IF}.conf <<EOF
+	wep_key0=${KEY}
+EOF
+			fi
+		;;
+	esac
+
+cat >> ${PARTDIR}/${IF}.conf <<EOF
+}
+EOF
+
+	if ! wpa_supplicant -D${DRIVER} -i${IF} -c${PARTDIR}/${I}.conf -B
+	then
+		wpa_cli -i${IF} terminate
+		return 1
+	fi
+
+	return 0
+}
+
+up_dhcp()
+{
+	local IF STATUS
+
+	IF="${1}"
+
+	if [ -f /run/dhclient-${IF}.pid ]
+	then
+		dbg_pid_found "dhclient-${IF}.pid"
+		kill -KILL $(cat /run/dhclient-${IF}.pid)
+		[ -f /run/dhclient-${IF}.pid ] && rm -f /run/dhclient-${IF}.pid
+	fi
+
+	if ! if_wireless ${IF}
+	then
+		debug "$(gettext 'Watting for wireless link')"
+		count=0
+		while [ "$(wpa_cli -i${IF} status | grep -E "^wpa_state=.*" | cut -d= -f 2)" != "COMPLETED" ]
+		do
+			let count="${count} + 1"
+			sleep 1
+			(( "${count}" >= "30" )) && break
+		done
+		debug "$(gettext 'Watting link finish')"
+	fi
+
+	debug "$(gettext 'Running dhclient')"
+	if ! dhclient -nw -pf /run/dhclient-${IF}.pid -lf /var/state/dhclient/${IF}.leases ${IF}
+	then
+		debug "$(gettext 'failed to run dhclient')"
+		return 1
+	fi
+
+	return 0
+}
+
+up_static()
+{
+	local IF="${1}"
+
+	if [ -z "${IPADDR}" ]
+	then
+		die "$(gettext 'Unable to read ip address from ${IF}')"
+		return 1
+	else
+		dbg_will_use IPADDR ${IPADDR}
+	fi
+
+	if [ -z "${NETMASK}" ]
+	then
+		eval $(rh-ipcalc -m ${IPADDR} | cut -d"=" -f2)
+		NETMASK=${NETMASK}
+
+		dbg_autoset NETMASK ${NETMASK}
+	else
+		dbg_will_use IPADDR ${IPADDR}
+	fi
+
+	if [ -z "${GATEWAY}" ]
+	then
+		eval $(rh-ipcalc -n ${IPADDR} ${NETMASK})
+		NETWORK="${NETWORK}"
+
+		dbg_autoset NETWORK ${NETWORK}
+	else
+		dbg_will_use IPADDR ${IPADDR}
+	fi
+
+	eval $(rh-ipcalc -p ${IPADDR} ${NETMASK})
+	PREFIX="${PREFIX}"
+	dbg_autoset PREFIX ${PREFIX}
+
+	if [ -z "${GATEWAY}" ]
+	then
+		GATEWAY="${NETWORK/.0/.1/}"
+		dbg_autoset GATEWAY ${GATEWAY}
+	else
+		dbg_will_use IPADDR ${IPADDR}
+	fi
+
+	debug "$(gettext 'Setting up ip addres')"
+	if ! ip addr add ${IPADDR}/${PREFIX} dev ${IF}
+	then
+		debug "$(gettext 'Failed to set ip address')"
+		return 1
+	fi
+
+	if [ "$(ip route show | grep -E "${NETWORK}/${PREFIX}" | cut -d ' ' -f 3)" != "${IF}" ]
+	then
+		debug "$(gettext 'Network route not fond...configuring')"
+		if ! ip route add ${NETWORK}/${PREFIX} dev ${IF}
+		then
+			debug "$(gettext 'Failed to set network route')"
+			return 1
+		fi
+	else
+		debug "$(gettext 'Network route found, skipping')"
+	fi
+
+	if [ "$(ip route show | grep -E "^default[[:space:]]" | cut -d ' ' -f 3)" != "${GATEWAY}" ]
+	then
+		debug "$(gettext 'Defautl gateway not fond...configuring')"
+		if ! ip route add default via ${GATEWAY}
+		then
+			debug "$(gettext 'Failed to set default gatway')"
+			return 1
+		fi
+	else
+		debug "$(gettext 'Default gateway found, skipping')"
+	fi
+
+	return 0
+}
+
+up_alias()
+{
+	local IF STATUS
+
+	IF="${1}"
+	STATUS="0"
+
+	if_configured ${IF}
+	reset_cfgfile
+	. ${CFGFILE}
+
+	if [ -z "${IPADDR}" ]
+	then
+		debug "$(gettext 'Unable to label interface. ip addres is missing')"
+		return 1
+	fi
+
+	if [ -z "${NETMASK}" ]
+	then
+		eval $(rh-ipcalc -m ${IPADDR} | cut -d"=" -f2)
+		NETMASK=${NETMASK}
+		dbg_autoset NETMASK ${NETMASK}
+	fi
+	eval $(rh-ipcalc -p ${IPADDR} ${NETMASK})
+	PREFIX="${PREFIX}"
+	dbg_autoset PREFIX ${PREFIX}
+
+	if if_state ${IF_MASTER}
+	then
+		debug "$(gettext 'Master interface is down ,setting up first')"
+		if ! up_interface ${IF_MASTER}
+		then
+			debug "$(gettext 'Setting up master interface failed')"
+		fi
+	fi
+
+	debug "$(gettext 'Labeling alias interface')"
+	if ! ip addr add ${IPADDR}/${PREFIX} label ${IF} dev ${IF_MASTER}
+	then
+		debug "$(gettext 'labeling alias interface failed')"
+		return 1
+	fi
+	
+	unset IF_MASTER IF_SLAVE
+
+	return 0
+}
+
+down_alias()
+{
+	[ -z "${IPADDR}" ] && return 1
+
+	if_configured ${IF}
+	reset_cfgfile
+	. ${CFGFILE}
+
+	if ! if_state ${IF_MASTER}
+	then
+		debug "$(gettext 'Deleting label from %s master')" "${IF_MASTER}"
+		if ! ip addr del local ${IPADDR} dev ${IF_MASTER}
+		then
+			debug "$(gettext 'Delete label failed')"
+			return 1
+		fi
+
+		if ! ip addr flush label ${1} dev ${IF_MASTER}
+		then
+			debug "$(gettext 'Interface flushing failed')"
+			return 1
+		fi
+	fi
+
+	return 0
+}
+
+up_interfaces()
+{
+	local FAIL
+
+	for I in ${@}
+	do
+		if ! if_alias ${I}
+		then
+			debug "$(gettext 'looks like alias interface, configuring')"
+			up_alias ${I}
+			return $?
+		fi
+
+		if_configured ${I}
+		if_detected   ${I}
+		reset_cfgfile
+		. ${CFGFILE}
+
+		commander pre_up && pre_up
+
+		if [ -r /run/netrc/${I}.pid ]
+		then
+			error "$(gettext '%s interface allready running')" ${I}
+			continue
+		fi
+
+		if [ -z "${PROTO}" ]
+		then
+			PROTO="dhcp"
+			dbg_autoset PROTO ${PROTO}
+		fi
+
+
+		if [ -z "${MTU}" ]
+		then
+			MTU="1500"
+			dbg_autoset MTU ${MTU}
+		fi
+
+		debug "$(gettext 'Setting up power on')"
+		if ! ip link set ${I} up
+		then
+			debug "$(gettext 'Failed to setting up power on')"
+			return 1
+		fi
+			
+		debug "$(gettext 'Setting up MTU')"
+		if ! ip link set ${I} mtu ${MTU}
+		then
+			debug "$(gettext 'Failed to set MTU')"
+			ip link set down ${I}
+			return 1
+		fi
+
+		if ! if_wireless ${I}
+		then
+			debug "(gettext 'Wireless extension found, running config')"
+			if ! up_wireless ${I}
+			then
+				debug "$(gettext 'failed to configure wireless')"
+				continue
+			fi
+		fi
+
+		case $(lower ${PROTO}) in
+			dhcp  )
+				debug "$(gettext 'Setting up automatic ip address')"
+				if ! up_dhcp ${I} 
+				then
+					die "$(gettext 'Failed to asign ip adress for %s interface')" ${I}
+					ip link set down ${I}
+					return 1
+				fi
+			;;
+			static) 
+				debug "$(gettext 'Setting up static ip address')"
+				if ! up_static ${I}
+				then
+					die "$(gettext 'Failed to asign static adress for %s interface')" ${I} 
+					ip link set down ${I}
+				fi
+			;;
+		esac
+
+		echo $$ > ${NETPIDS}/${I}.pid
+	done
+
+	return 0
+}
+
+down_interfaces()
+{
+	for I in ${@}
+	do
+		if ! if_alias ${I}
+		then
+			debug "$(gettext 'killing alias interface')"
+			down_alias ${I}
+			return $?
+		fi
+
+		if_configured ${I}
+		if_detected   ${I}
+		reset_cfgfile
+		. ${CFGFILE}
+
+		if if_state ${I}
+		then
+			error "$(gettext '%s interface looks like power off')" "${I}"
+			continue
+		fi
+
+		if [ -f /run/netrc/${I}.pid ]
+		then
+			error "$(gettext '%s interface is not running')" "${I}"
+			continue
+		fi
+
+		if [ -f /run/dhclient-${I}.pid ]
+		then
+			dbg_pid_found "dhclient-${I}.pid"
+			read -r MYPID < /run/dhclient-${I}.pid
+			if [ -d /proc/${MYPID} ]
+			then
+					kill -KILL ${MYPID}
+			fi
+			[ -f /run/dhclient-${I}.pid ] && rm -f /run/dhclient-${I}.pid
+		fi
+
+		if ! if_wireless 
+		then
+			debug "$(gettext 'Killing wpa_supplicant socket')"
+			wpa_cli -i${I} terminate &>/dev/null
+		fi
+
+		debug "$(gettext 'Setting up power down')"
+		ip link set down ${I}
+
+		debug "$(gettext 'Flushing all addresses')"
+		ip addr flush dev ${I}
+
+		rm -f ${NETPIDS}/${I}.pid
+	done
+}
+
+

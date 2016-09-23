@@ -1,0 +1,72 @@
+#!/bin/bash
+
+MYSELF="${0}"
+TEXTDOMAIN="${MYSELF##*/}"
+TEXTDOMAINDIR="/usr/share/locale"
+
+. /lib/init/net-functions || exit 1
+
+ONLY_UP=""
+ONLY_DOWN=""
+ONLY_CREATE=""
+ONLY_LIST=""
+ONLY_HELP=""
+
+AND_VERBOSE="0"
+AND_SILENT="0"
+
+OSHORT="udclhvq"
+OLONG="up,down,create,list,help,verbose,quiet"
+OGLOB="$(getopt --options ${OSHORT} --longoptions ${OLONG} --name ${MYSELF} -- "$@")"
+[ "$?" != "0" ] && exit >&2
+eval set -- ${OGLOB}
+
+while true
+do
+	case ${1} in
+		-u|--up      ) ONLY_UP="1"     ;;
+		-d|--down    ) ONLY_DOWN="1"   ;;
+		-c|--create  ) ONLY_CREATE="1" ;;
+		-l|--list    ) ONLY_LIST="1"   ;;
+		-h|--help    ) ONLY_HELP="1"   ;;
+		-v|--verbose ) AND_VERBOSE="1" ;;
+		-q|--quiet   ) ONLY_QUIET="1"  ;;
+		-- ) shift ; break             ;;
+	esac
+	shift
+done
+
+INPUT="${@}"
+
+declare -i INDEX=(
+	${ONLY_UP}
+	${ONLY_DOWN}
+	${ONLY_CREATE}
+	${ONLY_LIST}
+	${ONLY_HELP}
+)
+case ${#INDEX[@]} in
+	1 ) true ;;
+	0 ) die "$(gettext '%s need main argument')" "${MYSELF}" ;;
+	* ) die "$(gettext 'Only one main action at the same time')" ;;
+esac
+
+[ ! -d ${NETDIR} ] && die "$(gettext 'Interfaces directory does not exist')"
+
+if [ "${ONLY_UP}" == "1" ]
+then
+	up_interfaces ${INPUT}
+elif [ "${ONLY_DOWN}" == "1" ]
+then
+	down_interfaces ${INPUT}
+elif [ "${ONLY_CREATE}" == "1" ]
+then
+	create_interfaces ${INPUT}
+elif [ "${ONLY_LIST}" == "1" ]
+then
+	true
+elif [ "${ONLY_HELP}" == "1" ]
+then
+	usage
+	exit 0
+fi
